@@ -13,3 +13,4 @@ uuid = { version = "1.8.0", features = [
     "fast-rng",          # Use a faster (but still sufficiently random) RNG
 ] }
 tower-http = { version = "0.5.2", features = ["fs"] }
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "any", "postgres", "macros"] }
