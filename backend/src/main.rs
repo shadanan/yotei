@@ -5,12 +5,16 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+use sqlx::ConnectOptions;
 use std::sync::Arc;
 use tower_http::services::ServeFile;
 use uuid::Uuid;
 
 use std::time::Duration;
+
+use tower_http::trace::TraceLayer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Clone, serde::Serialize)]
 struct Task {
@@ -30,14 +34,26 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "yotei=trace,tower_http=trace,axum::rejection=trace,sqlx=trace".into()
+            }),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
     // Connect to the Postgres database.
     let db_connection_str =
         std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgresql://localhost".to_string());
-    format!("Connecting to database: {}", db_connection_str);
+    let mut opts: PgConnectOptions = db_connection_str.parse().unwrap();
+    // Enable query trace logging. Must enable `sqlx=trace`
+    opts = opts.log_statements(tracing::log::LevelFilter::Trace);
+    tracing::debug!("Connecting to database: {}", db_connection_str);
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .acquire_timeout(Duration::from_secs(3))
-        .connect(&db_connection_str)
+        .connect_with(opts)
         .await
         .expect("can't connect to database");
 
@@ -46,10 +62,13 @@ async fn main() {
         .route("/task/list", get(list_tasks))
         .route("/task/create", post(create_task))
         .route_service("/", ServeFile::new("assets/index.html"))
-        .with_state(state);
+        .with_state(state)
+        // Enable request tracing. Must enable `tower_http=debug`
+        .layer(TraceLayer::new_for_http());
 
     // run our app with hyper, listening globally on port 3000
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    tracing::debug!("listening on {}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();
 }
 
