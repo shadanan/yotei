@@ -28,7 +28,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use axum_streams::*;
 use tokio_stream::StreamExt;
 
-#[derive(Clone, serde::Serialize, sqlx::FromRow)]
+#[derive(Clone, serde::Serialize)]
 struct Task {
     id: String,
     name: String,
@@ -159,7 +159,8 @@ async fn list_tasks(
 async fn stream_tasks(Extension(pool): Extension<&'static PgPool>) -> impl IntoResponse {
     let tasks = sqlx::query_as("SELECT id, name from tasks")
         .fetch(pool)
-        .filter_map(|t: Result<Task, sqlx::Error>| t.ok());
+        .filter_map(|t: Result<(String, String), sqlx::Error>| t.ok())
+        .map(|t| Task { id: t.0, name: t.1 });
 
     StreamBodyAsOptions::new()
         .buffering_ready_items(50)
