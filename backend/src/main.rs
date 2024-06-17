@@ -26,7 +26,11 @@ use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-#[derive(serde::Serialize)]
+use axum_streams::*;
+use futures::{Stream, TryStreamExt};
+use serde::Serialize;
+
+#[derive(Clone, serde::Serialize, sqlx::FromRow)]
 struct Task {
     id: String,
     name: String,
@@ -78,6 +82,7 @@ async fn start_main_server() {
     let app = Router::new()
         .route("/task/list", get(list_tasks))
         .route("/task/create", post(create_task))
+        .route("/task/stream", get(stream_tasks))
         .route_service("/", ServeFile::new("assets/index.html"))
         .route_layer(middleware::from_fn(track_metrics))
         .fallback(handler_404)
@@ -151,6 +156,39 @@ async fn list_tasks(
     }
 
     Ok(Json(tasks))
+}
+
+async fn stream_tasks(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    StreamBodyAsOptions::new().json_array(task_stream(state).await.unwrap())
+}
+
+// async fn task_stream(state: Arc<AppState>) -> impl Stream<Item = Task> {
+//     // let mut results: std::pin::Pin<Box<dyn Stream<Item = Result<Task, sqlx::Error>> + Send>> =
+//     //     sqlx::query_as("SELECT id, name from tasks").fetch(&state.pool);
+//     // while let Some(task) = results.try_next().await.expect("oops") {
+//     //     yield task;
+//     // }
+
+// }
+
+async fn task_stream(
+    state: Arc<AppState>,
+) -> Result<impl Stream<Item = Task>, (StatusCode, String)> {
+    let results: Vec<(String, String)> = sqlx::query_as("SELECT id, name from tasks")
+        .fetch_all(&state.pool)
+        .await
+        .map_err(internal_error)?;
+
+    let mut tasks = Vec::new();
+    for row in results {
+        tasks.push(Task {
+            id: row.0,
+            name: row.1,
+        })
+    }
+
+    use tokio_stream::StreamExt;
+    Ok(futures::stream::iter(tasks).throttle(std::time::Duration::from_millis(50)))
 }
 
 /// Utility function for mapping any error into a `500 Internal Server Error` response.
