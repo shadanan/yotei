@@ -6,7 +6,7 @@ use axum::{
     response::IntoResponse,
     response::Json,
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
 use listenfd::ListenFd;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
@@ -27,8 +27,8 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use axum_streams::*;
-use futures::{Stream, TryStreamExt};
-use serde::Serialize;
+use futures::Stream;
+use tokio_stream::StreamExt;
 
 #[derive(Clone, serde::Serialize, sqlx::FromRow)]
 struct Task {
@@ -78,6 +78,20 @@ async fn start_main_server() {
         .await
         .expect("can't connect to database");
 
+    let opool = PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(Duration::from_secs(3))
+        .connect_with(
+            db_connection_str
+                .parse::<PgConnectOptions>()
+                .unwrap()
+                // Enable query trace logging. Must enable `sqlx=trace`
+                .log_statements(tracing::log::LevelFilter::Trace),
+        )
+        .await
+        .expect("can't connect to database");
+    let api_pool: &'static PgPool = Box::leak(Box::new(opool.clone()));
+
     let state = Arc::new(AppState { pool: pool.clone() });
     let app = Router::new()
         .route("/task/list", get(list_tasks))
@@ -93,6 +107,7 @@ async fn start_main_server() {
             // Graceful shutdown will wait for outstanding requests to complete. Add a timeout so
             // requests don't hang forever.
             TimeoutLayer::new(Duration::from_secs(10)),
+            Extension(api_pool),
         ));
 
     // We can either use a listener provided by the environment by ListenFd or
@@ -158,37 +173,11 @@ async fn list_tasks(
     Ok(Json(tasks))
 }
 
-async fn stream_tasks(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    StreamBodyAsOptions::new().json_array(task_stream(state).await.unwrap())
-}
+async fn stream_tasks(Extension(pool): Extension<&'static PgPool>) -> impl IntoResponse {
+    let tasks: std::pin::Pin<Box<dyn Stream<Item = Result<Task, sqlx::Error>> + Send>> =
+        sqlx::query_as("SELECT id, name from tasks").fetch(pool);
 
-// async fn task_stream(state: Arc<AppState>) -> impl Stream<Item = Task> {
-//     // let mut results: std::pin::Pin<Box<dyn Stream<Item = Result<Task, sqlx::Error>> + Send>> =
-//     //     sqlx::query_as("SELECT id, name from tasks").fetch(&state.pool);
-//     // while let Some(task) = results.try_next().await.expect("oops") {
-//     //     yield task;
-//     // }
-
-// }
-
-async fn task_stream(
-    state: Arc<AppState>,
-) -> Result<impl Stream<Item = Task>, (StatusCode, String)> {
-    let results: Vec<(String, String)> = sqlx::query_as("SELECT id, name from tasks")
-        .fetch_all(&state.pool)
-        .await
-        .map_err(internal_error)?;
-
-    let mut tasks = Vec::new();
-    for row in results {
-        tasks.push(Task {
-            id: row.0,
-            name: row.1,
-        })
-    }
-
-    use tokio_stream::StreamExt;
-    Ok(futures::stream::iter(tasks).throttle(std::time::Duration::from_millis(50)))
+    StreamBodyAs::json_array(tasks.filter_map(|t| t.ok()))
 }
 
 /// Utility function for mapping any error into a `500 Internal Server Error` response.
