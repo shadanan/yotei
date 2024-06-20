@@ -26,7 +26,6 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use axum_streams::StreamBodyAsOptions;
-use tokio_stream::StreamExt;
 
 #[derive(serde::Serialize)]
 struct Task {
@@ -156,11 +155,36 @@ async fn list_tasks(
     Ok(Json(tasks))
 }
 
+#[derive(serde::Serialize)]
+struct StreamTaskResult {
+    task: Option<Task>,
+    error: Option<StreamError>,
+}
+
+#[derive(serde::Serialize)]
+struct StreamError {
+    code: i32,
+    msg: String,
+}
+
 async fn stream_tasks(Extension(pool): Extension<&'static PgPool>) -> impl IntoResponse {
+    use tokio_stream::StreamExt;
+
     let tasks = sqlx::query_as("SELECT id, name from tasks")
         .fetch(pool)
-        .filter_map(|t: Result<(String, String), sqlx::Error>| t.ok())
-        .map(|t| Task { id: t.0, name: t.1 });
+        .map(|t: Result<(String, String), sqlx::Error>| match t {
+            Ok(t) => StreamTaskResult {
+                task: Option::Some(Task { id: t.0, name: t.1 }),
+                error: Option::None,
+            },
+            Err(e) => StreamTaskResult {
+                error: Option::Some(StreamError {
+                    code: 500,
+                    msg: e.to_string(),
+                }),
+                task: Option::None,
+            },
+        });
 
     StreamBodyAsOptions::new()
         .buffering_ready_items(5)
