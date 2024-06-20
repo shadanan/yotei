@@ -2,18 +2,36 @@
 -- Add a table update notification function
 CREATE OR REPLACE FUNCTION table_update_notify() RETURNS trigger AS $$
 DECLARE
-  id varchar;
-  name varchar;
+  rec RECORD;
+  dat RECORD;
 BEGIN
-  IF TG_OP = 'INSERT' OR TG_OP = 'UPDATE' THEN
-    id = NEW.id;
-    name = NEW.name;
+  CASE TG_OP
+  WHEN 'UPDATE' THEN
+     rec := NEW;
+     dat := OLD;
+  WHEN 'INSERT' THEN
+     rec := NEW;
+  WHEN 'DELETE' THEN
+     rec := OLD;
   ELSE
-    id = OLD.id;
-    name = old.name;
-  END IF;
-  PERFORM pg_notify('table_update', json_build_object('table', TG_TABLE_NAME, 'id', id, 'name', name, 'action_type', TG_OP)::text);
-  RETURN NEW;
+     RAISE EXCEPTION 'Unknown TG_OP: "%". Should not occur!', TG_OP;
+  END CASE;
+
+  PERFORM pg_notify(
+    'table_update',
+    json_build_object(
+      'timestamp', CURRENT_TIMESTAMP,
+      'action', UPPER(TG_OP),
+      'table', TG_TABLE_NAME,
+      'id', rec.id,
+      -- Include the entire new and old rows.
+      -- This doesn't scale though, there's a 3KB size limit on notify
+      'record', row_to_json(rec)::text,
+      'old', row_to_json(dat)::text
+    )::text
+  );
+
+  RETURN rec;
 END;
 $$ LANGUAGE plpgsql;
 

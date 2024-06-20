@@ -8,7 +8,7 @@ use sqlx::postgres::PgListener;
 use sqlx::{Pool, Postgres};
 
 #[derive(Deserialize, Debug)]
-pub enum ActionType {
+pub enum Action {
     INSERT,
     UPDATE,
     DELETE,
@@ -16,10 +16,12 @@ pub enum ActionType {
 
 #[derive(Deserialize, Debug)]
 pub struct Payload {
+    pub timestamp: String,
     pub table: String,
-    pub action_type: ActionType,
+    pub action: Action,
     pub id: String,
-    pub name: String,
+    pub record: String,
+    pub old: Option<String>,
 }
 
 pub async fn start_listening<T: DeserializeOwned + Sized + Debug>(
@@ -49,14 +51,14 @@ pub async fn start_listening<T: DeserializeOwned + Sized + Debug>(
 
 pub async fn listen_for_notifications(pool: &Pool<Postgres>) -> Result<(), Error> {
     let call_back = |payload: Payload| {
-        match payload.action_type {
-            ActionType::INSERT => {
+        match payload.action {
+            Action::INSERT => {
                 tracing::debug!("Processing insert event for payload '{:#?}'", payload);
             }
-            ActionType::UPDATE => {
+            Action::UPDATE => {
                 tracing::debug!("Processing update event for payload '{:#?}'", payload);
             }
-            ActionType::DELETE => {
+            Action::DELETE => {
                 tracing::debug!("Processing delete event for payload '{:#?}'", payload);
             }
         };
