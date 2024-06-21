@@ -131,16 +131,15 @@ async fn start_main_server() {
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal("server"))
-    .into_future();
-
-    let serve_res = serve_res.map(move |r| {
+    .into_future()
+    // Close the database pool after the server shuts down, when the future completes.
+    .map(move |r| {
         tracing::debug!("Closing database pool...");
         pool.close().map(|_| r)
     });
 
-    let (serve_res, notify_res) = tokio::join!(serve_res, listen_for_notifications(pool));
+    let (serve_res, _notify_res) = tokio::join!(serve_res, listen_for_notifications(pool));
     serve_res.await.unwrap();
-    tracing::debug!("Got db final lis res: {:#?}", notify_res);
 }
 
 async fn create_task(
