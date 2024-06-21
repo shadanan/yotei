@@ -2,17 +2,17 @@
 -- Add a table update notification function
 CREATE OR REPLACE FUNCTION table_update_notify() RETURNS trigger AS $$
 DECLARE
-  rec RECORD;
-  dat RECORD;
+  row_record RECORD;
+  old_record RECORD;
 BEGIN
   CASE TG_OP
   WHEN 'UPDATE' THEN
-     rec := NEW;
-     dat := OLD;
+     row_record := NEW;
+     old_record := OLD;
   WHEN 'INSERT' THEN
-     rec := NEW;
+     row_record := NEW;
   WHEN 'DELETE' THEN
-     rec := OLD;
+     row_record := OLD;
   ELSE
      RAISE EXCEPTION 'Unknown TG_OP: "%". Should not occur!', TG_OP;
   END CASE;
@@ -23,15 +23,15 @@ BEGIN
       'timestamp', CURRENT_TIMESTAMP,
       'action', UPPER(TG_OP),
       'table', TG_TABLE_NAME,
-      'id', rec.id,
+      'id', row_record.id,
       -- Include the entire new and old rows.
       -- This doesn't scale though, there's a 3KB size limit on notify
-      'record', row_to_json(rec)::text,
-      'old', row_to_json(dat)::text
+      'record', row_to_json(row_record)::text,
+      'old', row_to_json(old_record)::text
     )::text
   );
 
-  RETURN rec;
+  RETURN row_record;
 END;
 $$ LANGUAGE plpgsql;
 
