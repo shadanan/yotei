@@ -49,6 +49,7 @@ pub async fn start_listening<T: DeserializeOwned + Sized + Debug>(
     }
 }
 
+#[tracing::instrument(skip(pool))]
 pub async fn listen_for_notifications(pool: &Pool<Postgres>) -> Result<(), Error> {
     let call_back = |payload: Payload| {
         match payload.action {

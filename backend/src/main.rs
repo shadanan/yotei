@@ -69,6 +69,7 @@ async fn main() {
     let (_main_server, _metrics_server) = tokio::join!(start_main_server(), start_metrics_server());
 }
 
+#[tracing::instrument()]
 async fn start_main_server() {
     // Connect to the Postgres database.
     let db_connection_str =
@@ -131,7 +132,7 @@ async fn start_main_server() {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal("server"))
+    .with_graceful_shutdown(shutdown_signal("server").in_current_span())
     .into_future()
     // Close the database pool after the server shuts down, when the future completes.
     .map(move |r| {
@@ -143,6 +144,7 @@ async fn start_main_server() {
     serve_res.await.unwrap();
 }
 
+#[tracing::instrument(skip(pool))]
 async fn create_task(
     Extension(pool): Extension<&'static PgPool>,
     Json(new_task): Json<NewTask>,
@@ -161,6 +163,7 @@ async fn create_task(
     Ok(Json(task))
 }
 
+#[tracing::instrument(skip(pool))]
 async fn update_task(
     Extension(pool): Extension<&'static PgPool>,
     Json(task): Json<Task>,
@@ -190,6 +193,7 @@ async fn update_task(
     Ok(Json(task))
 }
 
+#[tracing::instrument(skip(pool))]
 async fn list_tasks(
     Extension(pool): Extension<&'static PgPool>,
 ) -> Result<Json<Vec<Task>>, (StatusCode, String)> {
@@ -209,6 +213,7 @@ async fn list_tasks(
     Ok(Json(tasks))
 }
 
+#[tracing::instrument(skip(pool))]
 async fn stream_tasks(Extension(pool): Extension<&'static PgPool>) -> impl IntoResponse {
     use tokio_stream::StreamExt;
 
@@ -273,6 +278,7 @@ async fn shutdown_signal(name: &str) {
     }
 }
 
+#[tracing::instrument()]
 async fn start_metrics_server() {
     const EXPONENTIAL_SECONDS: &[f64] = &[
         0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
@@ -297,7 +303,7 @@ async fn start_metrics_server() {
         listener.local_addr().unwrap()
     );
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal("metrics server"))
+        .with_graceful_shutdown(shutdown_signal("metrics server").in_current_span())
         .await
         .unwrap();
 }
