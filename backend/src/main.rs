@@ -10,14 +10,12 @@ use axum::{
     Extension, Router,
 };
 use axum_extra::{headers, TypedHeader};
-use futures::FutureExt;
 use listenfd::ListenFd;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use sqlx::ConnectOptions;
 use std::net::SocketAddr;
 use std::{borrow::BorrowMut, sync::Arc};
-use std::{fmt, future::IntoFuture};
 use std::{
     future::ready,
     time::{Duration, Instant},
@@ -37,7 +35,7 @@ use axum_streams::StreamBodyAsOptions;
 use axum::extract::connect_info::ConnectInfo;
 
 mod db_listener;
-use db_listener::{start_listening, Payload};
+use db_listener::{stream_task_notifications, Payload};
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 struct Task {
@@ -61,12 +59,6 @@ struct ChangeRouter {
 struct ClientRoute {
     sink: futures::stream::SplitSink<WebSocket, Message>,
     who: String,
-}
-
-impl fmt::Display for ClientRoute {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.who)
-    }
 }
 
 #[tokio::main]
@@ -103,11 +95,14 @@ async fn start_main_server() {
             .expect("can't connect to database"),
     ));
 
-    let change_stream = start_listening(pool);
+    // Create a stream of task notifications and a router to fan them out to client routes.
     let change_router = ChangeRouter {
         routes: Arc::new(Mutex::new(Vec::new())),
     };
-    tokio::spawn(handle_notify(change_router.clone(), change_stream));
+    tokio::spawn(handle_notify(
+        change_router.clone(),
+        stream_task_notifications(pool),
+    ));
 
     let state = Arc::new(AppState {});
     let app = Router::new()
@@ -153,15 +148,12 @@ async fn start_main_server() {
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal("server"))
-    .into_future()
-    // Close the database pool after the server shuts down, when the future completes.
-    .map(move |r| {
-        tracing::debug!("Closing database pool...");
-        pool.close().map(|_| r)
-    })
-    .await
     .await
     .unwrap();
+
+    // Now that the server is shutdown, it's safe to clean things up.
+    tracing::debug!("Closing database pool...");
+    pool.close().await;
 }
 
 async fn create_task(
@@ -268,6 +260,9 @@ async fn handler_404() -> impl IntoResponse {
     (StatusCode::NOT_FOUND, "404! Nothing to see here")
 }
 
+// Completion of this function signals to a server,
+// via graceful_shutdown, to begin shutdown.
+// As such, avoid doing cleanup work here.
 async fn shutdown_signal(name: &str) {
     let ctrl_c = async {
         signal::ctrl_c()
@@ -361,31 +356,28 @@ async fn ws_handler(
 ) -> impl IntoResponse {
     // finalize the upgrade process by returning upgrade callback.
     // we can customize the callback by sending additional info such as address.
-    tracing::debug!("opening web socket with client {addr}");
     ws.on_upgrade(move |socket| handle_socket(socket, addr, change_router))
 }
 
-/// Actual websocket statemachine (one will be spawned per connection)
 async fn handle_socket(socket: WebSocket, who: SocketAddr, change_router: ChangeRouter) {
     use futures::stream::StreamExt;
     let (sender, mut receiver) = socket.split();
-    let who = who.to_string();
 
+    let who = who.to_string();
+    // Store the sender side of the socket in the list of client routes.
     tracing::debug!("Adding route for client {who}");
     change_router.routes.lock().await.push(ClientRoute {
         sink: sender,
         who: who.clone(),
     });
 
+    // Listen for messages on the read side of the socket.
+    // We don't currently expect any messages other than closures.
+    // The idea is to proactively remove clients on closure rather
+    // than only sweeping them out while processing a notification.
     tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             match msg {
-                Message::Text(t) => {
-                    tracing::debug!(">>> {who} sent str: {t:?}");
-                }
-                Message::Binary(d) => {
-                    tracing::debug!(">>> {who} sent {} bytes: {:?}", d.len(), d);
-                }
                 Message::Close(c) => {
                     if let Some(cf) = c {
                         tracing::debug!(
@@ -399,15 +391,8 @@ async fn handle_socket(socket: WebSocket, who: SocketAddr, change_router: Change
                     // TODO: Close and remove the client route from the change_router.
                     break;
                 }
-
-                Message::Pong(v) => {
-                    tracing::debug!(">>> {who} sent pong with {v:?}");
-                }
-                // You should never need to manually handle Message::Ping, as axum's websocket library
-                // will do so for you automagically by replying with Pong and copying the v according to
-                // spec. But if you need the contents of the pings you can see them here.
-                Message::Ping(v) => {
-                    tracing::debug!(">>> {who} sent ping with {v:?}");
+                _ => {
+                    tracing::debug!(">>> {who} sent unsolicited message: {msg:?}");
                 }
             }
         }
@@ -418,14 +403,13 @@ use futures::stream::Stream;
 
 async fn handle_notify(
     change_router: ChangeRouter,
-    ss: impl Stream<Item = Result<Payload, sqlx::Error>>,
+    change_stream: impl Stream<Item = Result<Payload, sqlx::Error>>,
 ) {
     use futures::StreamExt;
-    futures::pin_mut!(ss);
+    futures::pin_mut!(change_stream);
 
     loop {
-        tracing::debug!("Waiting for notification...");
-        match ss.next().await {
+        match change_stream.next().await {
             Some(Ok(payload)) => {
                 let payload = Message::Text(serde_json::to_string(&payload).unwrap());
                 let mut routes = change_router.routes.lock().await;
@@ -440,13 +424,15 @@ async fn handle_notify(
                     payload
                 );
 
-                use futures::sink::SinkExt;
-
+                // Route the notification to all clients.
+                // Along the way, prune any dead clients.
+                // TODO: Doing this serially won't scale to many clients.
                 let mut i = 0;
                 while i < routes.len() {
                     let client_route = routes[i].borrow_mut();
 
                     tracing::debug!("Notifying client {}", client_route.who);
+                    use futures::sink::SinkExt;
                     match client_route.sink.send(payload.clone()).await {
                         Ok(_) => {
                             tracing::debug!("Sent to {}", client_route.who);
@@ -458,6 +444,7 @@ async fn handle_notify(
                                 client_route.who,
                                 e
                             );
+                            // TODO: Only remove the route when the error indicates closure.
                             routes.remove(i);
                         }
                     }
@@ -468,6 +455,8 @@ async fn handle_notify(
                 continue;
             }
             Some(Err(e)) => {
+                // TODO: Make sure all errors should be fatal and prevent the notifier from running further.
+                // On termination, the error `attempted to acquire a connection on a closed pool` is seen here.
                 tracing::debug!("Finishing notifier with error: {}", e);
                 break;
             }
