@@ -16,7 +16,7 @@ use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use sqlx::ConnectOptions;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{borrow::BorrowMut, sync::Arc};
 use std::{fmt, future::IntoFuture};
 use std::{
     future::ready,
@@ -105,7 +105,7 @@ async fn start_main_server() {
 
     let change_stream = start_listening(pool);
     let change_router = ChangeRouter {
-        routes: Arc::new(Mutex::new(Vec::with_capacity(100))),
+        routes: Arc::new(Mutex::new(Vec::new())),
     };
     tokio::spawn(handle_notify(change_router.clone(), change_stream));
 
@@ -369,13 +369,13 @@ async fn ws_handler(
 async fn handle_socket(socket: WebSocket, who: SocketAddr, change_router: ChangeRouter) {
     use futures::stream::StreamExt;
     let (sender, mut receiver) = socket.split();
+    let who = who.to_string();
 
-    let cr: ClientRoute = ClientRoute {
+    tracing::debug!("Adding route for client {who}");
+    change_router.routes.lock().await.push(ClientRoute {
         sink: sender,
-        who: who.to_string(),
-    };
-    tracing::debug!("Adding route for client {}", cr.who);
-    change_router.routes.lock().await.push(cr);
+        who: who.clone(),
+    });
 
     tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
@@ -442,11 +442,24 @@ async fn handle_notify(
 
                 use futures::sink::SinkExt;
 
-                for client_route in routes.iter_mut() {
+                let mut i = 0;
+                while i < routes.len() {
+                    let client_route = routes[i].borrow_mut();
+
                     tracing::debug!("Notifying client {}", client_route.who);
                     match client_route.sink.send(payload.clone()).await {
-                        Ok(_) => tracing::debug!("Sent to {}", client_route.who),
-                        Err(e) => tracing::debug!("Failed to send to {}: {}", client_route.who, e),
+                        Ok(_) => {
+                            tracing::debug!("Sent to {}", client_route.who);
+                            i += 1;
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "Failed to send to {}, removing route: {}",
+                                client_route.who,
+                                e
+                            );
+                            routes.remove(i);
+                        }
                     }
                 }
             }
