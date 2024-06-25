@@ -54,12 +54,12 @@ struct AppState {}
 
 #[derive(Clone)]
 struct ChangeRouter {
-    sockets: Arc<Mutex<Vec<ClientRoute>>>,
+    routes: Arc<Mutex<Vec<ClientRoute>>>,
 }
 
 #[derive(Debug)]
 struct ClientRoute {
-    socket: WebSocket,
+    sink: futures::stream::SplitSink<WebSocket, Message>,
     who: String,
 }
 
@@ -105,7 +105,7 @@ async fn start_main_server() {
 
     let change_stream = start_listening(pool);
     let change_router = ChangeRouter {
-        sockets: Arc::new(Mutex::new(Vec::with_capacity(100))),
+        routes: Arc::new(Mutex::new(Vec::with_capacity(100))),
     };
     tokio::spawn(handle_notify(change_router.clone(), change_stream));
 
@@ -367,12 +367,51 @@ async fn ws_handler(
 
 /// Actual websocket statemachine (one will be spawned per connection)
 async fn handle_socket(socket: WebSocket, who: SocketAddr, change_router: ChangeRouter) {
+    use futures::stream::StreamExt;
+    let (sender, mut receiver) = socket.split();
+
     let cr: ClientRoute = ClientRoute {
-        socket,
+        sink: sender,
         who: who.to_string(),
     };
     tracing::debug!("Adding route for client {}", cr.who);
-    change_router.sockets.lock().await.push(cr);
+    change_router.routes.lock().await.push(cr);
+
+    tokio::spawn(async move {
+        while let Some(Ok(msg)) = receiver.next().await {
+            match msg {
+                Message::Text(t) => {
+                    tracing::debug!(">>> {who} sent str: {t:?}");
+                }
+                Message::Binary(d) => {
+                    tracing::debug!(">>> {who} sent {} bytes: {:?}", d.len(), d);
+                }
+                Message::Close(c) => {
+                    if let Some(cf) = c {
+                        tracing::debug!(
+                            ">>> {who} sent close with code {} and reason `{}`",
+                            cf.code,
+                            cf.reason
+                        );
+                    } else {
+                        tracing::debug!(">>> {who} somehow sent close message without CloseFrame");
+                    }
+                    // TODO: Close and remove the client route from the change_router.
+                    break;
+                }
+
+                Message::Pong(v) => {
+                    tracing::debug!(">>> {who} sent pong with {v:?}");
+                }
+                // You should never need to manually handle Message::Ping, as axum's websocket library
+                // will do so for you automagically by replying with Pong and copying the v according to
+                // spec. But if you need the contents of the pings you can see them here.
+                Message::Ping(v) => {
+                    tracing::debug!(">>> {who} sent ping with {v:?}");
+                }
+            }
+        }
+    });
 }
 
 use futures::stream::Stream;
@@ -389,11 +428,11 @@ async fn handle_notify(
         match ss.next().await {
             Some(Ok(payload)) => {
                 let payload = Message::Text(serde_json::to_string(&payload).unwrap());
-                let mut sockets = change_router.sockets.lock().await;
+                let mut routes = change_router.routes.lock().await;
                 tracing::debug!(
                     "Notifying {} clients ({}) with: {:?}",
-                    sockets.len(),
-                    sockets
+                    routes.len(),
+                    routes
                         .iter()
                         .map(|cr| &*cr.who)
                         .collect::<Vec<&str>>()
@@ -401,11 +440,13 @@ async fn handle_notify(
                     payload
                 );
 
-                for client_route in sockets.iter_mut() {
+                use futures::sink::SinkExt;
+
+                for client_route in routes.iter_mut() {
                     tracing::debug!("Notifying client {}", client_route.who);
-                    match client_route.socket.send(payload.clone()).await {
-                        Ok(_) => tracing::debug!("Sent"),
-                        Err(e) => tracing::debug!("Failed {}", e),
+                    match client_route.sink.send(payload.clone()).await {
+                        Ok(_) => tracing::debug!("Sent to {}", client_route.who),
+                        Err(e) => tracing::debug!("Failed to send to {}: {}", client_route.who, e),
                     }
                 }
             }
