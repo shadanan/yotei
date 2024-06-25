@@ -1,46 +1,43 @@
 use axum::{
-    extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    extract::{MatchedPath, Request},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        MatchedPath, Request,
+    },
     http::StatusCode,
     middleware::{self, Next},
-    response::IntoResponse,
-    response::Json,
+    response::{IntoResponse, Json},
     routing::{get, post},
     Extension, Router,
 };
 use axum_extra::{headers, TypedHeader};
 use futures::FutureExt;
 use listenfd::ListenFd;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use sqlx::ConnectOptions;
 use std::net::SocketAddr;
-use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::{borrow::Cow, future::IntoFuture};
-use tokio::signal;
-use tower_http::services::ServeFile;
-use tower_http::timeout::TimeoutLayer;
-use tracing::{debug, Instrument};
-use uuid::Uuid;
-
-use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+use std::{fmt, future::IntoFuture};
 use std::{
     future::ready,
     time::{Duration, Instant},
 };
 use tokio::net::TcpListener;
+use tokio::signal;
+use tokio::sync::Mutex;
+use tower_http::services::ServeFile;
+use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
-
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use uuid::Uuid;
 
 use axum_streams::StreamBodyAsOptions;
 
 //allows to extract the IP of connecting user
 use axum::extract::connect_info::ConnectInfo;
-use axum::extract::ws::CloseFrame;
 
 mod db_listener;
-use db_listener::listen_for_notifications;
+use db_listener::{start_listening, Payload};
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 struct Task {
@@ -54,6 +51,23 @@ struct NewTask {
 }
 
 struct AppState {}
+
+#[derive(Clone)]
+struct ChangeRouter {
+    sockets: Arc<Mutex<Vec<ClientRoute>>>,
+}
+
+#[derive(Debug)]
+struct ClientRoute {
+    socket: WebSocket,
+    who: String,
+}
+
+impl fmt::Display for ClientRoute {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.who)
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -89,6 +103,12 @@ async fn start_main_server() {
             .expect("can't connect to database"),
     ));
 
+    let change_stream = start_listening(pool);
+    let change_router = ChangeRouter {
+        sockets: Arc::new(Mutex::new(Vec::with_capacity(100))),
+    };
+    tokio::spawn(handle_notify(change_router.clone(), change_stream));
+
     let state = Arc::new(AppState {});
     let app = Router::new()
         .route("/task/list", get(list_tasks))
@@ -109,6 +129,7 @@ async fn start_main_server() {
             // requests don't hang forever.
             TimeoutLayer::new(Duration::from_secs(10)),
             Extension(pool),
+            Extension(change_router),
         ));
 
     // We can either use a listener provided by the environment by ListenFd or
@@ -127,7 +148,7 @@ async fn start_main_server() {
     };
 
     tracing::debug!("server listening on {}", listener.local_addr().unwrap());
-    let serve_res = axum::serve(
+    axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
@@ -137,10 +158,10 @@ async fn start_main_server() {
     .map(move |r| {
         tracing::debug!("Closing database pool...");
         pool.close().map(|_| r)
-    });
-
-    let (serve_res, _notify_res) = tokio::join!(serve_res, listen_for_notifications(pool));
-    serve_res.await.unwrap();
+    })
+    .await
+    .await
+    .unwrap();
 }
 
 async fn create_task(
@@ -336,158 +357,66 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     _user_agent: Option<TypedHeader<headers::UserAgent>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Extension(change_router): Extension<ChangeRouter>,
 ) -> impl IntoResponse {
     // finalize the upgrade process by returning upgrade callback.
     // we can customize the callback by sending additional info such as address.
     tracing::debug!("opening web socket with client {addr}");
-    ws.on_upgrade(move |socket| handle_socket(socket, addr))
+    ws.on_upgrade(move |socket| handle_socket(socket, addr, change_router))
 }
 
 /// Actual websocket statemachine (one will be spawned per connection)
-async fn handle_socket(mut socket: WebSocket, who: SocketAddr) {
-    // send a ping (unsupported by some browsers) just to kick things off and get a response
-    if !socket.send(Message::Ping(vec![1, 2, 3])).await.is_ok() {
-        tracing::debug!("Could not send ping {who}!");
-        // no Error here since the only thing we can do is to close the connection.
-        // If we can not send messages, there is no way to salvage the statemachine anyway.
-        return;
-    }
-    tracing::debug!("Pinged {who}...");
+async fn handle_socket(socket: WebSocket, who: SocketAddr, change_router: ChangeRouter) {
+    let cr: ClientRoute = ClientRoute {
+        socket,
+        who: who.to_string(),
+    };
+    tracing::debug!("Adding route for client {}", cr.who);
+    change_router.sockets.lock().await.push(cr);
+}
 
-    // receive single message from a client (we can either receive or send with socket).
-    // this will likely be the Pong for our Ping or a hello message from client.
-    // waiting for message from a client will block this task, but will not block other client's
-    // connections.
-    if let Some(msg) = socket.recv().await {
-        if let Ok(msg) = msg {
-            if process_message(msg, who).is_break() {
-                return;
+use futures::stream::Stream;
+
+async fn handle_notify(
+    change_router: ChangeRouter,
+    ss: impl Stream<Item = Result<Payload, sqlx::Error>>,
+) {
+    use futures::StreamExt;
+    futures::pin_mut!(ss);
+
+    loop {
+        tracing::debug!("Waiting for notification...");
+        match ss.next().await {
+            Some(Ok(payload)) => {
+                let payload = Message::Text(serde_json::to_string(&payload).unwrap());
+                let mut sockets = change_router.sockets.lock().await;
+                tracing::debug!(
+                    "Notifying {} clients ({}) with: {:?}",
+                    sockets.len(),
+                    sockets
+                        .iter()
+                        .map(|cr| &*cr.who)
+                        .collect::<Vec<&str>>()
+                        .join(", "),
+                    payload
+                );
+
+                for client_route in sockets.iter_mut() {
+                    tracing::debug!("Notifying client {}", client_route.who);
+                    match client_route.socket.send(payload.clone()).await {
+                        Ok(_) => tracing::debug!("Sent"),
+                        Err(e) => tracing::debug!("Failed {}", e),
+                    }
+                }
             }
-        } else {
-            tracing::debug!("client {who} abruptly disconnected");
-            return;
-        }
-    }
-
-    // Since each client gets individual statemachine, we can pause handling
-    // when necessary to wait for some external event (in this case illustrated by sleeping).
-    // Waiting for this client to finish getting its greetings does not prevent other clients from
-    // connecting to server and receiving their greetings.
-    for i in 1..5 {
-        tracing::debug!("sending 'Hi {i} times!' to client {who}");
-        if socket
-            .send(Message::Text(format!("Hi {i} times!")))
-            .await
-            .is_err()
-        {
-            tracing::debug!("client {who} abruptly disconnected");
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-
-    // By splitting socket we can send and receive at the same time. In this example we will send
-    // unsolicited messages to client based on some sort of server's internal event (i.e .timer).
-    use futures::{sink::SinkExt, stream::StreamExt};
-    let (mut sender, mut receiver) = socket.split();
-
-    // Spawn a task that will push several messages to the client (does not matter what client does)
-    let mut send_task = tokio::spawn(async move {
-        let n_msg = 20;
-        for i in 0..n_msg {
-            // In case of any websocket error, we exit.
-            tracing::debug!("sending 'Server message {i} ...' to client {who}");
-            if sender
-                .send(Message::Text(format!("Server message {i} ...")))
-                .await
-                .is_err()
-            {
-                return i;
+            None => {
+                tracing::debug!("Got None from notify stream; continuing");
+                continue;
             }
-
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        }
-
-        tracing::debug!("Sending close to {who}...");
-        if let Err(e) = sender
-            .send(Message::Close(Some(CloseFrame {
-                code: axum::extract::ws::close_code::NORMAL,
-                reason: Cow::from("Goodbye"),
-            })))
-            .await
-        {
-            tracing::debug!("Could not send Close due to {e}, probably it is ok?");
-        }
-        n_msg
-    });
-
-    // This second task will receive messages from client and print them on server console
-    let mut recv_task = tokio::spawn(async move {
-        let mut cnt = 0;
-        while let Some(Ok(msg)) = receiver.next().await {
-            cnt += 1;
-            // print message and break if instructed to do so
-            if process_message(msg, who).is_break() {
+            Some(Err(e)) => {
+                tracing::debug!("Finishing notifier with error: {}", e);
                 break;
             }
         }
-        cnt
-    });
-
-    // If any one of the tasks exit, abort the other.
-    tokio::select! {
-        rv_a = (&mut send_task) => {
-            match rv_a {
-                Ok(a) => tracing::debug!("{a} messages sent to {who}"),
-                Err(a) => tracing::debug!("Error sending messages {a:?}")
-            }
-            recv_task.abort();
-        },
-        rv_b = (&mut recv_task) => {
-            match rv_b {
-                Ok(b) => tracing::debug!("Received {b} messages"),
-                Err(b) => tracing::debug!("Error receiving messages {b:?}")
-            }
-            send_task.abort();
-        }
     }
-
-    // returning from the handler closes the websocket connection
-    tracing::debug!("Websocket context {who} destroyed");
-}
-
-/// helper to print contents of messages to stdout. Has special treatment for Close.
-fn process_message(msg: Message, who: SocketAddr) -> ControlFlow<(), ()> {
-    match msg {
-        Message::Text(t) => {
-            tracing::debug!(">>> {who} sent str: {t:?}");
-        }
-        Message::Binary(d) => {
-            tracing::debug!(">>> {} sent {} bytes: {:?}", who, d.len(), d);
-        }
-        Message::Close(c) => {
-            if let Some(cf) = c {
-                tracing::debug!(
-                    ">>> {} sent close with code {} and reason `{}`",
-                    who,
-                    cf.code,
-                    cf.reason
-                );
-            } else {
-                tracing::debug!(">>> {who} somehow sent close message without CloseFrame");
-            }
-            return ControlFlow::Break(());
-        }
-
-        Message::Pong(v) => {
-            tracing::debug!(">>> {who} sent pong with {v:?}");
-        }
-        // You should never need to manually handle Message::Ping, as axum's websocket library
-        // will do so for you automagically by replying with Pong and copying the v according to
-        // spec. But if you need the contents of the pings you can see them here.
-        Message::Ping(v) => {
-            tracing::debug!(">>> {who} sent ping with {v:?}");
-        }
-    }
-    ControlFlow::Continue(())
 }
