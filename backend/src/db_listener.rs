@@ -1,19 +1,16 @@
+use async_stream::try_stream;
+use futures::stream::Stream;
+use sqlx::{postgres::PgListener, Pool, Postgres};
 use std::fmt::Debug;
 
-use serde::Deserialize;
-use serde::Serialize;
-
-use sqlx::postgres::PgListener;
-use sqlx::{Pool, Postgres};
-
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(serde::Deserialize, serde::Serialize, Debug)]
 pub enum Action {
     INSERT,
     UPDATE,
     DELETE,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(serde::Deserialize, serde::Serialize, Debug)]
 pub struct Payload {
     pub timestamp: String,
     pub table: String,
@@ -26,14 +23,11 @@ pub struct Payload {
     pub old: Option<String>,
 }
 
-use futures::stream::Stream;
-
 /// Creates a stream of insert, update and delete task notifications.
 pub fn stream_task_notifications(
     pool: &Pool<Postgres>,
 ) -> impl Stream<Item = Result<Payload, sqlx::Error>> + '_ {
     let channels: Vec<&str> = vec!["table_update"];
-    use async_stream::try_stream;
 
     try_stream! {
         tracing::debug!("Setting up DB listeners on channels {:?}..", channels);

@@ -1,5 +1,6 @@
 use axum::{
     extract::{
+        connect_info::ConnectInfo,
         ws::{Message, WebSocket, WebSocketUpgrade},
         MatchedPath, Request,
     },
@@ -10,32 +11,31 @@ use axum::{
     Extension, Router,
 };
 use axum_extra::{headers, TypedHeader};
+use axum_streams::StreamBodyAsOptions;
 use listenfd::ListenFd;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
-use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
-use sqlx::ConnectOptions;
-use std::net::SocketAddr;
-use std::{borrow::BorrowMut, sync::Arc};
+use sqlx::{
+    postgres::{PgConnectOptions, PgPool, PgPoolOptions},
+    ConnectOptions,
+};
 use std::{
+    borrow::BorrowMut,
     future::ready,
+    net::SocketAddr,
+    sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::net::TcpListener;
-use tokio::signal;
-use tokio::sync::Mutex;
-use tower_http::services::ServeFile;
-use tower_http::timeout::TimeoutLayer;
-use tower_http::trace::{DefaultMakeSpan, TraceLayer};
+use tokio::{net::TcpListener, signal, sync::Mutex};
+use tower_http::{
+    services::ServeFile,
+    timeout::TimeoutLayer,
+    trace::{DefaultMakeSpan, TraceLayer},
+};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
-use axum_streams::StreamBodyAsOptions;
-
-//allows to extract the IP of connecting user
-use axum::extract::connect_info::ConnectInfo;
-
 mod db_listener;
-use db_listener::{stream_task_notifications, Payload};
+use crate::db_listener::{stream_task_notifications, Payload};
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 struct Task {
