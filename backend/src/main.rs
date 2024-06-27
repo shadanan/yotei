@@ -78,7 +78,7 @@ async fn start_main_server() {
             .expect("can't connect to database"),
     ));
 
-    let (change_router, notify_task) = notify::start_notifications(pool.clone());
+    let (notifier, notify_task) = notify::start_notifications(pool.clone());
 
     let state = Arc::new(AppState {});
     let app = Router::new()
@@ -100,7 +100,7 @@ async fn start_main_server() {
             // requests don't hang forever.
             TimeoutLayer::new(Duration::from_secs(10)),
             Extension(pool),
-            Extension(change_router),
+            Extension(notifier),
         ));
 
     // We can either use a listener provided by the environment by ListenFd or
@@ -233,11 +233,11 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     _user_agent: Option<TypedHeader<headers::UserAgent>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Extension(change_router): Extension<notify::ChangeRouter>,
+    Extension(notifier): Extension<notify::Notifier>,
 ) -> impl IntoResponse {
     // finalize the upgrade process by returning upgrade callback.
     // we can customize the callback by sending additional info such as address.
-    ws.on_upgrade(move |socket| change_router.add_client(socket, addr))
+    ws.on_upgrade(move |socket| notifier.register_destination(socket, addr))
 }
 
 /// Utility function for mapping any error into a `500 Internal Server Error` response.
