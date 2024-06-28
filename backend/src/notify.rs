@@ -2,8 +2,9 @@ use async_stream::try_stream;
 use axum::extract::ws::{Message, WebSocket};
 use futures::stream::Stream;
 use sqlx::{postgres::PgListener, Pool, Postgres};
-use std::{borrow::BorrowMut, fmt::Debug, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, net::SocketAddr, sync::Arc};
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 pub fn start_notifications(
     pool: sqlx::Pool<sqlx::Postgres>,
@@ -11,20 +12,20 @@ pub fn start_notifications(
     // Create a stream of task notifications and a notifier to fan them out to destinations (clients).
     let stream = stream_task_notifications(pool);
     let notifier = Notifier {
-        destinations: Arc::new(Mutex::new(Vec::new())),
-        new_destinations: Arc::new(Mutex::new(Vec::new())),
+        destinations: Arc::new(Mutex::new(HashMap::new())),
+        new_destinations: Arc::new(Mutex::new(HashMap::new())),
     };
     let notify_task = tokio::spawn(notifier.clone().from_stream(stream));
     (notifier, notify_task)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Notifier {
     /// Existing destinations to notify.
-    destinations: Arc<Mutex<Vec<Destination>>>,
+    destinations: Arc<Mutex<HashMap<String, Destination>>>,
     /// Newly added destinations that will be moved to `destinations`
     /// when the next notification is processed.
-    new_destinations: Arc<Mutex<Vec<Destination>>>,
+    new_destinations: Arc<Mutex<HashMap<String, Destination>>>,
 }
 
 #[derive(Debug)]
@@ -38,13 +39,16 @@ impl Notifier {
         use futures::stream::StreamExt;
         let (sender, mut receiver) = socket.split();
 
-        let who = who.to_string();
+        let who = who.to_string() + ":" + &Uuid::new_v4().to_string();
         // Store the sender side of the socket in the list of destinations.
         tracing::debug!("Adding destination for client {who}");
-        self.new_destinations.lock().await.push(Destination {
-            sink: sender,
-            who: who.clone(),
-        });
+        self.new_destinations.lock().await.insert(
+            who.clone(),
+            Destination {
+                sink: sender,
+                who: who.clone(),
+            },
+        );
 
         // Listen for messages on the read side of the socket.
         // We don't currently expect any messages other than closures.
@@ -65,7 +69,10 @@ impl Notifier {
                                 ">>> {who} somehow sent close message without CloseFrame"
                             );
                         }
-                        // TODO: Close and remove the destination.
+                        // Remove from both destinations maps as the client may not
+                        // have been moved to destinations yet!
+                        self.new_destinations.lock().await.remove(&who);
+                        self.destinations.lock().await.remove(&who);
                         break;
                     }
                     _ => {
@@ -83,21 +90,28 @@ impl Notifier {
         loop {
             match change_stream.next().await {
                 Some(Ok(payload)) => {
+                    use futures::sink::SinkExt;
+
+                    let mut destinations = self.destinations.lock().await;
+
                     // First, move any new destinations into the destinations list.
                     // Doing this reduces contention while inserting new destinations
                     // and fanning out to all destinations below.
-                    self.destinations
-                        .lock()
-                        .await
-                        .append(self.new_destinations.lock().await.borrow_mut());
+                    // For this to be effective, release the lock asap, before fanning out below.
+                    {
+                        let mut new_dests = self.new_destinations.lock().await;
+                        for k in new_dests.keys().cloned().collect::<Vec<String>>() {
+                            let new_dest = new_dests.remove(&k).unwrap();
+                            destinations.insert(k, new_dest);
+                        }
+                    }
 
                     let payload = Message::Text(serde_json::to_string(&payload).unwrap());
-                    let mut destinations = self.destinations.lock().await;
                     tracing::debug!(
                         "Notifying {} clients ({}) with: {:?}",
                         destinations.len(),
                         destinations
-                            .iter()
+                            .values()
                             .map(|cr| &*cr.who)
                             .collect::<Vec<&str>>()
                             .join(", "),
@@ -107,28 +121,28 @@ impl Notifier {
                     // Send the notification to all destinations.
                     // Along the way, prune any dead destinations.
                     // TODO: Doing this serially won't scale to many clients.
-                    let mut i = 0;
-                    while i < destinations.len() {
-                        let destination = destinations[i].borrow_mut();
-
+                    let mut dead_destinations = Vec::new();
+                    for destination in destinations.values_mut() {
                         tracing::debug!("Notifying client {}", destination.who);
-                        use futures::sink::SinkExt;
                         match destination.sink.send(payload.clone()).await {
                             Ok(_) => {
                                 tracing::debug!("Sent to {}", destination.who);
-                                i += 1;
                             }
                             Err(e) => {
                                 tracing::debug!(
-                                    "Failed to send to {}, removing destination: {}",
+                                    "Failed to send to {}, will remove destination: {}",
                                     destination.who,
                                     e
                                 );
                                 // TODO: Only remove the destination when the error indicates closure.
-                                let _ = destination.sink.close().await;
-                                destinations.remove(i);
+                                dead_destinations.push(destination.who.clone());
                             }
                         }
+                    }
+
+                    for k in &dead_destinations {
+                        let mut dead_dest = destinations.remove(k).unwrap();
+                        let _ = dead_dest.sink.close().await;
                     }
                 }
                 None => {
