@@ -42,13 +42,15 @@ impl Notifier {
         let who = who.to_string() + ":" + &Uuid::new_v4().to_string();
         // Store the sender side of the socket in the list of destinations.
         tracing::debug!("Registering destination for client {who}");
-        self.new_destinations.lock().await.insert(
+        if let Some(existing) = self.new_destinations.lock().await.insert(
             who.clone(),
             Destination {
                 sink: sender,
                 who: who.clone(),
             },
-        );
+        ) {
+            tracing::warn!("Unexpectedly, destination {who} already exists: {existing:?}")
+        }
 
         // Listen for messages on the read side of the socket.
         // We don't currently expect any messages other than closures.
@@ -72,12 +74,15 @@ impl Notifier {
                         // If no notification has been processed since registration,
                         // the destination may be in the "new" map, so check both.
                         let dest = self.new_destinations.lock().await.remove(&who);
+                        let other_dest = self.destinations.lock().await.remove(&who);
+                        if dest.is_none() && other_dest.is_none() {
+                            tracing::warn!("Unexpectedly, received close for client {who} while no destination was registered.")
+                        }
                         if dest.is_some() {
                             let _ = dest.unwrap().sink.close().await;
                         }
-                        let dest = self.destinations.lock().await.remove(&who);
-                        if dest.is_some() {
-                            let _ = dest.unwrap().sink.close().await;
+                        if other_dest.is_some() {
+                            let _ = other_dest.unwrap().sink.close().await;
                         }
                         break;
                     }
@@ -108,7 +113,9 @@ impl Notifier {
                         let mut new_dests = self.new_destinations.lock().await;
                         for k in new_dests.keys().cloned().collect::<Vec<String>>() {
                             let new_dest = new_dests.remove(&k).unwrap();
-                            destinations.insert(k, new_dest);
+                            if let Some(existing_dest) = destinations.insert(k, new_dest) {
+                                tracing::warn!("Unexpectedly found existing dest when adding new dest: {existing_dest:?}")
+                            }
                         }
                     }
 
