@@ -1,6 +1,6 @@
 use async_stream::try_stream;
 use axum::extract::ws::{Message, WebSocket};
-use futures::stream::Stream;
+use futures::{stream::Stream, FutureExt, SinkExt};
 use sqlx::{postgres::PgListener, Pool, Postgres};
 use std::{collections::HashMap, fmt::Debug, net::SocketAddr, sync::Arc};
 use tokio::sync::Mutex;
@@ -41,7 +41,7 @@ impl Notifier {
 
         let who = who.to_string() + ":" + &Uuid::new_v4().to_string();
         // Store the sender side of the socket in the list of destinations.
-        tracing::debug!("Adding destination for client {who}");
+        tracing::debug!("Registering destination for client {who}");
         self.new_destinations.lock().await.insert(
             who.clone(),
             Destination {
@@ -58,25 +58,31 @@ impl Notifier {
             while let Some(Ok(msg)) = receiver.next().await {
                 match msg {
                     Message::Close(c) => {
+                        let reason;
                         if let Some(cf) = c {
-                            tracing::debug!(
-                                ">>> {who} sent close with code {} and reason `{}`",
-                                cf.code,
-                                cf.reason
-                            );
+                            reason = format!("code:'{}', detail:'{}'", cf.code, cf.reason);
                         } else {
-                            tracing::debug!(
-                                ">>> {who} somehow sent close message without CloseFrame"
-                            );
+                            reason = "code:'NONE', detail:'No CloseFrame'".to_string();
                         }
-                        // Remove from both destinations maps as the client may not
-                        // have been moved to destinations yet!
-                        self.new_destinations.lock().await.remove(&who);
-                        self.destinations.lock().await.remove(&who);
+                        tracing::debug!(
+                            "Removing destination for closed client {who}. Reason: {reason}"
+                        );
+
+                        // Remove the destination and close the sink.
+                        // If no notification has been processed since registration,
+                        // the destination may be in the "new" map, so check both.
+                        let dest = self.new_destinations.lock().await.remove(&who);
+                        if dest.is_some() {
+                            let _ = dest.unwrap().sink.close().await;
+                        }
+                        let dest = self.destinations.lock().await.remove(&who);
+                        if dest.is_some() {
+                            let _ = dest.unwrap().sink.close().await;
+                        }
                         break;
                     }
                     _ => {
-                        tracing::debug!(">>> {who} sent unsolicited message: {msg:?}");
+                        tracing::debug!("Discarding unsolicited message from {who}: {msg:?}");
                     }
                 }
             }
@@ -107,43 +113,22 @@ impl Notifier {
                     }
 
                     let payload = Message::Text(serde_json::to_string(&payload).unwrap());
-                    tracing::debug!(
-                        "Notifying {} clients ({}) with: {:?}",
-                        destinations.len(),
-                        destinations
-                            .values()
-                            .map(|cr| &*cr.who)
-                            .collect::<Vec<&str>>()
-                            .join(", "),
-                        payload
-                    );
+                    tracing::debug!("Notifying {} clients with: {payload:?}", destinations.len());
 
-                    // Send the notification to all destinations.
-                    // Along the way, prune any dead destinations.
-                    // TODO: Doing this serially won't scale to many clients.
-                    let mut dead_destinations = Vec::new();
+                    // Send the notification to all destinations in parallel.
+                    let mut results = Vec::new();
                     for destination in destinations.values_mut() {
                         tracing::debug!("Notifying client {}", destination.who);
-                        match destination.sink.send(payload.clone()).await {
+                        results.push(destination.sink.send(payload.clone()).map(|r| match r {
                             Ok(_) => {
-                                tracing::debug!("Sent to {}", destination.who);
+                                tracing::debug!("Notified {}", destination.who);
                             }
                             Err(e) => {
-                                tracing::debug!(
-                                    "Failed to send to {}, will remove destination: {}",
-                                    destination.who,
-                                    e
-                                );
-                                // TODO: Only remove the destination when the error indicates closure.
-                                dead_destinations.push(destination.who.clone());
+                                tracing::debug!("Failed to notify {}: {}", destination.who, e);
                             }
-                        }
+                        }));
                     }
-
-                    for k in &dead_destinations {
-                        let mut dead_dest = destinations.remove(k).unwrap();
-                        let _ = dead_dest.sink.close().await;
-                    }
+                    futures::future::join_all(results).await;
                 }
                 None => {
                     tracing::debug!("Got None from notify stream; continuing");
