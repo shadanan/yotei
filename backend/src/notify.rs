@@ -60,14 +60,13 @@ impl Notifier {
             while let Some(Ok(msg)) = receiver.next().await {
                 match msg {
                     Message::Close(c) => {
-                        let reason;
-                        if let Some(cf) = c {
-                            reason = format!("code:'{}', detail:'{}'", cf.code, cf.reason);
-                        } else {
-                            reason = "code:'NONE', detail:'No CloseFrame'".to_string();
-                        }
                         tracing::debug!(
-                            "Removing destination for closed client {who}. Reason: {reason}"
+                            "Removing destination for closed client {who}. Reason: {}",
+                            if let Some(cf) = &c {
+                                format!("code:'{}', detail:'{}'", cf.code, cf.reason)
+                            } else {
+                                "code:'NONE', detail:'No CloseFrame'".to_string()
+                            }
                         );
 
                         // Remove the destination and close the sink.
@@ -78,11 +77,11 @@ impl Notifier {
                         if dest.is_none() && other_dest.is_none() {
                             tracing::warn!("Unexpectedly, received close for client {who} while no destination was registered.")
                         }
-                        if dest.is_some() {
-                            let _ = dest.unwrap().sink.close().await;
+                        if let Some(mut dest) = dest {
+                            let _ = dest.sink.close().await;
                         }
-                        if other_dest.is_some() {
-                            let _ = other_dest.unwrap().sink.close().await;
+                        if let Some(mut other_dest) = other_dest {
+                            let _ = other_dest.sink.close().await;
                         }
                         break;
                     }
