@@ -5,17 +5,22 @@
   export let tasks: Map<string, Task>;
   export let rootTaskId: string;
 
-  let draggedTaskId: string | null = null;
-  let maybePeerTaskId: string | null = null;
-  let maybeChildTaskId: string | null = null;
+  type RenderedTask = {
+    task: Task;
+    path: string[];
+    ghost: boolean;
+  };
+
+  let draggedTask: RenderedTask | null = null;
+  let maybePeerTask: RenderedTask | null = null;
+  let maybeChildTask: RenderedTask | null = null;
 
   let expanded = new Map<string, boolean>();
-  for (const [taskId, _] of tasks) {
-    expanded.set(taskId, true);
+  function isExpanded(task: RenderedTask): boolean {
+    return expanded.get(task.path.join("-")) ?? true;
   }
-
-  function toggleExpanded(taskId: string) {
-    expanded = expanded.set(taskId, !expanded.get(taskId));
+  function toggleExpanded(task: RenderedTask) {
+    expanded = expanded.set(task.path.join("-"), !isExpanded(task));
   }
 
   function hasCycle(parent: string, child: string): boolean {
@@ -30,19 +35,20 @@
     return false;
   }
 
-  function isValid(parent: string, child: string): boolean {
-    if (hasCycle(parent, child)) {
+  function isValid(parent: RenderedTask, child: RenderedTask): boolean {
+    if (hasCycle(parent.task.id, child.task.id)) {
       return false;
     }
-    if (tasks.get(parent)?.children.includes(child)) {
+    if (tasks.get(parent.task.id)?.children.includes(child.task.id)) {
       return false;
     }
     return true;
   }
 
-  function dragstart(event: DragEvent, taskId: string) {
-    draggedTaskId = taskId;
+  function dragstart(event: DragEvent, task: RenderedTask) {
+    draggedTask = task;
     event.dataTransfer!.effectAllowed = "linkMove";
+    const taskId = task.path.join("-");
 
     document.getElementById(`peer-dropzone-${taskId}`)!.hidden = true;
     document.getElementById(`child-dropzone-${taskId}`)!.hidden = true;
@@ -61,102 +67,106 @@
 
   function dragover(
     event: DragEvent,
-    draggedOverTaskId: string,
+    draggedOverTask: RenderedTask,
     relationship: "peer" | "child",
   ) {
     event.preventDefault();
-    if (draggedTaskId === null) {
+    if (draggedTask === null) {
       return;
     }
-    if (!isValid(draggedOverTaskId, draggedTaskId)) {
+    if (!isValid(draggedOverTask, draggedTask)) {
       return;
     }
     if (relationship === "child") {
-      maybeChildTaskId = draggedOverTaskId;
+      maybeChildTask = draggedOverTask;
     } else if (relationship === "peer") {
-      maybePeerTaskId = draggedOverTaskId;
+      maybePeerTask = draggedOverTask;
     }
   }
 
   function dragleave(event: DragEvent) {
     event.preventDefault();
-    maybeChildTaskId = null;
-    maybePeerTaskId = null;
+    maybeChildTask = null;
+    maybePeerTask = null;
   }
 
   function drop(
     event: DragEvent,
-    droppedTaskId: string,
+    droppedTask: RenderedTask,
     relationship: "peer" | "child",
   ) {
     event.preventDefault();
-    if (draggedTaskId === null) {
+    if (draggedTask === null) {
       return;
     }
-    if (!isValid(droppedTaskId, draggedTaskId)) {
+    if (!isValid(droppedTask, draggedTask)) {
       return;
     }
     if (relationship === "child") {
-      tasks.get(droppedTaskId)!.children.splice(0, 0, draggedTaskId);
+      const parent = tasks.get(droppedTask.task.id)!;
+      parent.children.splice(0, 0, draggedTask.task.id);
       tasks = tasks;
     } else if (relationship === "peer") {
-      for (const [_, task] of tasks) {
-        const index = task.children.indexOf(droppedTaskId);
-        if (index !== -1) {
-          task.children.splice(index + 1, 0, draggedTaskId);
-        }
-      }
+      const parentId = droppedTask.path[droppedTask.path.length - 2];
+      const parent = tasks.get(parentId)!;
+      const index = parent.children.indexOf(droppedTask.task.id);
+      parent.children.splice(index + 1, 0, draggedTask.task.id);
       tasks = tasks;
     }
   }
 
-  function dragend(event: DragEvent, taskId: string) {
+  function dragend(event: DragEvent, task: RenderedTask) {
     event.preventDefault();
-    draggedTaskId = null;
-    maybeChildTaskId = null;
-    maybePeerTaskId = null;
+    const taskId = task.path.join("-");
+    draggedTask = null;
+    maybeChildTask = null;
+    maybePeerTask = null;
     document.getElementById(`peer-dropzone-${taskId}`)!.hidden = false;
     document.getElementById(`child-dropzone-${taskId}`)!.hidden = false;
   }
 
-  type RenderedTask = {
-    task: Task;
-    level: number;
-    ghost: boolean;
-  };
-
   let renderedTasks: RenderedTask[] = [];
-  function flatten(task: Task, depth: number) {
-    renderedTasks.push({
+  function flatten(task: Task, parent: string[]) {
+    const path = parent.concat(task.id);
+    const renderedTask: RenderedTask = {
       task,
-      level: depth,
+      path,
       ghost: false,
-    });
-    if (expanded.get(task.id)!) {
-      if (draggedTaskId && maybeChildTaskId === task.id) {
-        renderedTasks.push({
-          task: tasks.get(draggedTaskId)!,
-          level: depth + 1,
-          ghost: true,
-        });
-      }
+    };
+    renderedTasks.push(renderedTask);
+    if (
+      draggedTask &&
+      maybeChildTask &&
+      maybeChildTask.path.join("-") == renderedTask.path.join("-")
+    ) {
+      renderedTasks.push({
+        task: draggedTask.task,
+        path: path.concat(draggedTask.task.id),
+        ghost: true,
+      });
+    }
+    if (isExpanded(renderedTask)) {
       for (const childId of task.children) {
         const child = tasks.get(childId)!;
-        flatten(child, depth + 1);
+        flatten(child, path);
       }
     }
-    if (draggedTaskId && maybePeerTaskId === task.id) {
+    if (
+      draggedTask &&
+      maybePeerTask &&
+      maybePeerTask.path.join("-") === renderedTask.path.join("-")
+    ) {
       renderedTasks.push({
-        task: tasks.get(draggedTaskId)!,
-        level: depth,
+        task: draggedTask.task,
+        path: parent.concat(draggedTask.task.id),
         ghost: true,
       });
     }
   }
   $: {
-    expanded, maybeChildTaskId, maybePeerTaskId;
+    expanded, maybeChildTask, maybePeerTask;
     renderedTasks = [];
-    flatten(tasks.get(rootTaskId)!, 0);
+    flatten(tasks.get(rootTaskId)!, []);
   }
 </script>
 
@@ -181,9 +191,10 @@
     class="[&>*:nth-child(even)]:bg-gray-100 [&>*:nth-child(odd)]:bg-gray-200"
   >
     {#each renderedTasks as renderedTask}
-      {@const isExpanded = expanded.get(renderedTask.task.id)}
+      {@const taskId = renderedTask.path.join("-")}
+      {@const expanded = isExpanded(renderedTask)}
       <div
-        id="row-{renderedTask.task.id}"
+        id="row-{taskId}"
         class="my-1 flex items-center rounded p-2"
         style="opacity: {renderedTask.ghost ? 0.5 : 1};"
       >
@@ -191,41 +202,39 @@
           <div class="flex items-center">
             <button
               class="w-5"
-              style="margin-left: {renderedTask.level * 1.25}rem;"
-              on:click={() => toggleExpanded(renderedTask.task.id)}
+              style="margin-left: {(renderedTask.path.length - 1) * 1.25}rem;"
+              on:click={() => toggleExpanded(renderedTask)}
             >
               {#if renderedTask.task.hasChildren()}
                 <AngleRightOutline
                   class="h-4 transition-transform"
-                  style="transform:rotate({isExpanded ? '90' : '0'}deg)"
+                  style="transform:rotate({expanded ? '90' : '0'}deg)"
                 />
               {/if}
             </button>
             <button
-              id="handle-{renderedTask.task.id}"
+              id="handle-{taskId}"
               class="relative w-5"
               draggable={true}
-              on:dragstart={(event) => dragstart(event, renderedTask.task.id)}
-              on:dragend={(event) => dragend(event, renderedTask.task.id)}
+              on:dragstart={(event) => dragstart(event, renderedTask)}
+              on:dragend={(event) => dragend(event, renderedTask)}
             >
               <BarsOutline class="h-4" />
               <div
-                id="peer-dropzone-{renderedTask.task.id}"
+                id="peer-dropzone-{taskId}"
                 class="absolute -left-6 z-50 h-7 w-12"
                 role="table"
-                on:dragover={(event) =>
-                  dragover(event, renderedTask.task.id, "peer")}
+                on:dragover={(event) => dragover(event, renderedTask, "peer")}
                 on:dragleave={(event) => dragleave(event)}
-                on:drop={(event) => drop(event, renderedTask.task.id, "peer")}
+                on:drop={(event) => drop(event, renderedTask, "peer")}
               />
               <div
-                id="child-dropzone-{renderedTask.task.id}"
+                id="child-dropzone-{taskId}"
                 class="absolute left-6 z-50 h-7 w-12"
                 role="table"
-                on:dragover={(event) =>
-                  dragover(event, renderedTask.task.id, "child")}
+                on:dragover={(event) => dragover(event, renderedTask, "child")}
                 on:dragleave={(event) => dragleave(event)}
-                on:drop={(event) => drop(event, renderedTask.task.id, "child")}
+                on:drop={(event) => drop(event, renderedTask, "child")}
               />
             </button>
             <div>{renderedTask.task.id}</div>
