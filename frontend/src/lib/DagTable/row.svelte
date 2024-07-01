@@ -135,7 +135,7 @@
         {#if canDragDrop}
           <div
             id="peer-dropzone-{path.id}"
-            class="absolute -left-6 z-50 h-7 w-12 bg-red-500"
+            class="absolute -left-6 z-50 h-7 w-12"
             role="table"
             on:dragover={(event) => dragOver(event, "peer")}
             on:dragleave={(event) => dragLeave(event)}
@@ -143,7 +143,7 @@
           />
           <div
             id="child-dropzone-{path.id}"
-            class="absolute left-6 z-50 h-7 w-12 bg-blue-500"
+            class="absolute left-6 z-50 h-7 w-12"
             role="table"
             on:dragover={(event) => dragOver(event, "child")}
             on:dragleave={(event) => dragLeave(event)}
